@@ -263,3 +263,36 @@ helpdesk-schema-repair/
 ├── README.md                    ← this file — update with your decisions
 └── package.json                 ← npm scripts — do not edit
 ```
+
+
+---
+
+## ERD-to-Schema Decisions
+
+### Decision 1: [Column type decision]
+ERD said: Entities in the ER diagram specified conceptual types: `uuid id PK` across all tables, `string plan "starter|pro|enterprise"`, `string role "agent|supervisor|admin"`, `string priority "low|medium|high|urgent"`, `string status "open|pending|resolved|closed"`, `boolean internal`, and `timestamp` fields.
+Schema decided: Used PostgreSQL `UUID` with `gen_random_uuid()` for all primary keys and foreign keys, `TEXT NOT NULL CHECK (...)` for constrained string columns, `BOOLEAN NOT NULL DEFAULT FALSE` for `internal`, and `TIMESTAMPTZ` (timestamp with time zone) for all temporal fields (`created_at`, `deactivated_at`, `resolved_at`, and `added_at`).
+Reason: `TIMESTAMPTZ` stores exact instants in UTC, avoiding timezone skew and ambiguity for multi-region support systems where SLA and resolution timestamps are audited. Using `TEXT` with `CHECK` constraints enforces domain validity without the migration friction and table-locking hazards associated with native PostgreSQL `ENUM` types. `UUID` prevents predictable integer enumeration attacks and facilitates distributed ID generation.
+
+### Decision 2: [ON DELETE decision]
+ERD said: Specified relationships between entities (`Organization ||--o{ Agent`, `Organization ||--o{ Ticket`, `Organization ||--o{ Tag`, `Agent ||--o{ Ticket : "created_by"`, `Agent o|--o{ Ticket : "assigned to"`, `Agent ||--o{ Comment : "authored"`, `Ticket ||--o{ Comment`, `Ticket ||--o{ TicketTag`, `Tag ||--o{ TicketTag`, `Agent ||--o{ TicketTag : "added_by"`), but conceptual ER diagrams do not specify physical deletion semantics.
+Schema decided: Configured explicit `ON DELETE` rules across all 10 foreign keys:
+- `RESTRICT` on `agents.org_id`, `tickets.org_id`, `tickets.created_by`, `comments.author_id`, and `ticket_tags.added_by`.
+- `SET NULL` on `tickets.assignee_id`.
+- `CASCADE` on `comments.ticket_id`, `tags.org_id`, `ticket_tags.ticket_id`, and `ticket_tags.tag_id`.
+Reason: In customer service, compliance and auditing require an immutable record of who filed a ticket, wrote a response, or applied a tag (`RESTRICT`). If an assigned staff member is removed, the ticket should remain intact and merely become unassigned (`SET NULL`) so work is not lost. Conversely, dependent entities that cannot exist independently of their parent—such as comments on a ticket or join entries linking tickets and tags—must be automatically cleaned up (`CASCADE`) to avoid orphaned records.
+
+### Decision 3: [Default value decision]
+ERD said: Conceptual attributes such as `id PK`, `created_at`, `status "open|pending|resolved|closed"`, `internal "visible to agents only"`, and `added_at` did not define SQL defaults.
+Schema decided: Implemented database-level `DEFAULT` values: `id DEFAULT gen_random_uuid()`, `created_at DEFAULT NOW()`, `added_at DEFAULT NOW()`, `status DEFAULT 'open'`, and `internal DEFAULT FALSE`.
+Reason: Pushing default generation into PostgreSQL guarantees data consistency regardless of which client application or microservice inserts records. Automatic timestamp assignment (`NOW()`) and UUID generation (`gen_random_uuid()`) prevent clock-skew errors or omitted IDs from application code. Defaulting status to `'open'` and comment visibility to `FALSE` (customer-facing) ensures new tickets and comments enter the system in a known, safe state without requiring explicit boilerplate on every insert.
+
+## Rejected Table Shape
+
+### Shape: Tags stored as array on ticket (`ALTER TABLE tickets ADD COLUMN tags TEXT[];`)
+What it was: A denormalized array column (`tags TEXT[]`) on the `tickets` table storing tag names as plain text strings.
+Why rejected: It violates First Normal Form (1NF) and completely breaks the ER diagram's relational model. In the ERD, `Tag` is an organization-scoped entity (`Organization ||--o{ Tag : "defines"`) with its own properties (`name`, `color_hex`). A ticket's relationship to tags is Many-to-Many ($M:N$), which requires an associative join entity (`TicketTag`) containing audit metadata (`added_by`, `added_at`).
+What would break:
+1. Multi-tenancy and tag management: Organizations could not define, restrict, or enforce a uniform set of tags; any arbitrary string could be added.
+2. Metadata loss: Visual UI attributes like `color_hex` and audit trails (`added_by`, `added_at`) cannot be tracked on individual array elements.
+3. Query performance & integrity: Searching or aggregating tickets by tag would require expensive unnesting or GIN index scans, and renaming or deleting an organization tag would necessitate updating millions of array elements across the `tickets` table instead of a simple, cascade-backed relational operation.
